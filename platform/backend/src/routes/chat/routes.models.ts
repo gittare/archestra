@@ -6,8 +6,14 @@ import {
   type SupportedProvider,
   SupportedProvidersSchema,
 } from "@shared";
+import { AwsV4Signer } from "aws4fetch";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import {
+  getBedrockCredentialProvider,
+  getBedrockRegion,
+  isBedrockIamAuthEnabled,
+} from "@/clients/bedrock-credentials";
 import {
   createGoogleGenAIClient,
   isVertexAiEnabled,
@@ -33,8 +39,8 @@ import {
   ModelCapabilitiesSchema,
   ModelWithApiKeysSchema,
   type OpenAi,
+  PatchModelBodySchema,
   SelectModelSchema,
-  UpdateModelPricingSchema,
   UuidIdSchema,
 } from "@/types";
 
@@ -45,6 +51,8 @@ const ChatModelSchema = z.object({
   provider: SupportedProvidersSchema,
   createdAt: z.string().optional(),
   capabilities: ModelCapabilitiesSchema.optional(),
+  isBest: z.boolean().optional(),
+  isFastest: z.boolean().optional(),
 });
 
 export interface ModelInfo {
@@ -709,8 +717,10 @@ async function fetchDeepSeekModels(
 }
 
 /**
- * Fetch models from AWS Bedrock API
- * Uses Bearer token authentication (proxy handles AWS credentials)
+ * Fetch models from AWS Bedrock API using ListInferenceProfiles.
+ * Only returns models the customer actually has access to (inference profiles),
+ * unlike ListFoundationModels which returns all models in the region.
+ * Uses Bearer token authentication (proxy handles AWS credentials).
  */
 export async function fetchBedrockModels(
   apiKey: string,
@@ -722,99 +732,37 @@ export async function fetchBedrockModels(
     return [];
   }
 
-  // Remove '-runtime' from base URL to get the control plane endpoint
-  const url = `${baseUrl.replace("-runtime", "")}/foundation-models?byOutputModality=TEXT&byInputModality=TEXT`;
-
-  const response = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
+  const controlPlaneUrl = baseUrl.replace("-runtime", "");
+  const profiles = await fetchAllBedrockInferenceProfiles(controlPlaneUrl, {
+    Authorization: `Bearer ${apiKey}`,
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    logger.error(
-      { status: response.status, error: errorText },
-      "Failed to fetch Bedrock models",
-    );
-    throw new Error(`Failed to fetch Bedrock models: ${response.status}`);
-  }
+  return mapInferenceProfilesToModels(profiles);
+}
 
-  const data = (await response.json()) as {
-    modelSummaries?: Array<{
-      modelId?: string;
-      modelName?: string;
-      providerName?: string;
-      inferenceTypesSupported?: string[];
-      inputModalities?: string[];
-    }>;
-  };
-
-  logger.info(
-    { url, modelCount: data.modelSummaries?.length, data },
-    "[fetchBedrockModels] full response from Bedrock ListFoundationModels",
-  );
-
-  if (!data.modelSummaries) {
-    logger.warn("No models returned from Bedrock ListFoundationModels");
+/**
+ * Fetch models from AWS Bedrock API via IAM credentials (IRSA, env vars, instance profile).
+ * Uses SigV4 signing for authentication instead of API keys.
+ * Uses ListInferenceProfiles to only return models the customer has access to.
+ */
+export async function fetchBedrockModelsViaIam(): Promise<ModelInfo[]> {
+  const baseUrl = config.llm.bedrock.baseUrl;
+  if (!baseUrl) {
+    logger.warn("Bedrock base URL not configured");
     return [];
   }
 
-  // Filter to include models that support on-demand or inference profile (cross-region)
-  // INFERENCE_PROFILE models (like Claude) require the prefix env var to be set
-  const inferenceProfilePrefix = config.llm.bedrock.inferenceProfilePrefix;
+  const controlPlaneUrl = baseUrl.replace("-runtime", "");
+  const region = getBedrockRegion(baseUrl);
+  const creds = await getBedrockCredentialProvider()();
 
-  const models = data.modelSummaries
-    .filter((model) => {
-      // Must support TEXT input modality
-      if (!model.inputModalities?.includes("TEXT")) {
-        return false;
-      }
-
-      const supportsOnDemand =
-        model.inferenceTypesSupported?.includes("ON_DEMAND");
-      const supportsInferenceProfile =
-        model.inferenceTypesSupported?.includes("INFERENCE_PROFILE");
-
-      // Include ON_DEMAND models always
-      // Include INFERENCE_PROFILE models only if prefix is configured
-      return (
-        supportsOnDemand || (supportsInferenceProfile && inferenceProfilePrefix)
-      );
-    })
-    .map((model) => {
-      // Generate a readable display name
-      const providerName = model.providerName || "Unknown";
-      const modelName = model.modelName || model.modelId || "Unknown Model";
-      const displayName = `${providerName} ${modelName}`;
-
-      // For INFERENCE_PROFILE models, prefix with region (e.g., "us" or "eu")
-      const isInferenceProfile =
-        model.inferenceTypesSupported?.includes("INFERENCE_PROFILE");
-      const prefix = inferenceProfilePrefix.endsWith(".")
-        ? inferenceProfilePrefix
-        : `${inferenceProfilePrefix}.`;
-      const modelId =
-        isInferenceProfile && inferenceProfilePrefix
-          ? `${prefix}${model.modelId}`
-          : model.modelId;
-
-      return {
-        id: modelId || "",
-        displayName,
-        provider: "bedrock" as const,
-      };
-    });
-
-  logger.info(
-    {
-      modelCount: models.length,
-      models: models.map((m) => ({ id: m.id, displayName: m.displayName })),
-    },
-    "[fetchBedrockModels] filtered models returned for bedrock",
+  const profiles = await fetchAllBedrockInferenceProfiles(
+    controlPlaneUrl,
+    {},
+    { region, creds },
   );
 
-  return models;
+  return mapInferenceProfilesToModels(profiles);
 }
 
 /**
@@ -881,52 +829,29 @@ export async function fetchGeminiModelsViaVertexAi(): Promise<ModelInfo[]> {
   const ai = createGoogleGenAIClient(undefined, "[ChatModels]");
 
   const pager = await ai.models.list({ config: { pageSize: 100 } });
-
-  const models: ModelInfo[] = [];
-
-  // Patterns to exclude non-chat models
-  const excludePatterns = ["embedding", "imagen", "text-bison", "code-bison"];
+  const discoveredModels: ModelInfo[] = [];
 
   for await (const model of pager) {
-    const modelName = model.name ?? "";
-
-    // Only include Gemini models that are chat-capable
-    // Vertex AI returns names like "publishers/google/models/gemini-2.0-flash-001"
-    if (!modelName.includes("gemini")) {
-      continue;
+    const modelInfo = extractVertexGeminiModel(model);
+    if (modelInfo) {
+      discoveredModels.push(modelInfo);
     }
-
-    // Exclude embedding and other non-chat models
-    const isExcluded = excludePatterns.some((pattern) =>
-      modelName.toLowerCase().includes(pattern),
-    );
-    if (isExcluded) {
-      continue;
-    }
-
-    // Extract model ID from "publishers/google/models/gemini-xxx" format
-    const modelId = modelName.replace("publishers/google/models/", "");
-
-    // Generate a readable display name from the model ID
-    // e.g., "gemini-2.0-flash-001" -> "Gemini 2.0 Flash 001"
-    const displayName = modelId
-      .split("-")
-      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(" ");
-
-    models.push({
-      id: modelId,
-      displayName,
-      provider: "gemini" as const,
-    });
   }
 
   logger.debug(
-    { modelCount: models.length },
+    { modelCount: discoveredModels.length },
     "Fetched Gemini models via Vertex AI SDK",
   );
 
-  return models;
+  const fallbackModels = await fetchVertexGeminiFallbackModels({
+    ai,
+    existingModelIds: new Set(discoveredModels.map((model) => model.id)),
+    shouldRunFallback:
+      discoveredModels.length === 0 ||
+      !discoveredModels.some((model) => isPrimaryVertexGeminiModel(model.id)),
+  });
+
+  return dedupeModelsById([...discoveredModels, ...fallbackModels]);
 }
 
 /**
@@ -1030,6 +955,9 @@ export async function fetchModelsForProvider({
   // Gemini with Vertex AI uses ADC instead of API keys
   const vertexAiEnabled = provider === "gemini" && isVertexAiEnabled();
 
+  // Bedrock with IAM auth uses AWS credential chain instead of API keys
+  const bedrockIamEnabled = provider === "bedrock" && isBedrockIamAuthEnabled();
+
   // Some providers don't require API keys but need base URL configured
   const isKeylessProviderEnabled =
     (provider === "vllm" && config.llm.vllm.enabled) ||
@@ -1041,6 +969,7 @@ export async function fetchModelsForProvider({
   if (
     !apiKey &&
     !vertexAiEnabled &&
+    !bedrockIamEnabled &&
     !isKeylessProviderEnabled &&
     !isBedrockEnabled
   ) {
@@ -1057,6 +986,9 @@ export async function fetchModelsForProvider({
     if (provider === "gemini" && vertexAiEnabled) {
       // Vertex AI uses ADC for authentication, not API keys
       models = await fetchGeminiModelsViaVertexAi();
+    } else if (provider === "bedrock" && bedrockIamEnabled) {
+      // Bedrock with IAM uses AWS credential chain, not API keys
+      models = await fetchBedrockModelsViaIam();
     } else {
       // All other providers use the standard model fetcher with an API key
       // (keyless providers like vLLM/Ollama/MiniMax/Perplexity pass "EMPTY" as a placeholder)
@@ -1094,12 +1026,13 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         tags: ["Chat"],
         querystring: z.object({
           provider: SupportedProvidersSchema.optional(),
+          apiKeyId: z.string().uuid().optional(),
         }),
         response: constructResponseSchema(z.array(ChatModelSchema)),
       },
     },
     async ({ query, organizationId, user }, reply) => {
-      const { provider } = query;
+      const { provider, apiKeyId } = query;
 
       // Trigger models.dev metadata sync in background if needed
       modelsDevClient.syncIfNeeded();
@@ -1117,6 +1050,7 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         {
           organizationId,
           provider,
+          apiKeyId,
           apiKeyCount: apiKeys.length,
           apiKeys: apiKeys.map((k) => ({
             id: k.id,
@@ -1129,7 +1063,19 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
       );
 
       // Get models from database based on user's API keys
-      const apiKeyIds = apiKeys.map((k) => k.id);
+      // If a specific apiKeyId is provided and it's in the user's accessible keys,
+      // only return models for that key
+      const accessibleKeyIds = apiKeys.map((k) => k.id);
+      if (apiKeyId && !accessibleKeyIds.includes(apiKeyId)) {
+        logger.warn(
+          { apiKeyId, organizationId, userId: user.id },
+          "Requested apiKeyId not found in user's accessible keys, falling back to all keys",
+        );
+      }
+      const apiKeyIds =
+        apiKeyId && accessibleKeyIds.includes(apiKeyId)
+          ? [apiKeyId]
+          : accessibleKeyIds;
       const dbModels = await ApiKeyModelModel.getModelsForApiKeyIds(apiKeyIds);
 
       logger.info(
@@ -1144,15 +1090,17 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       // Filter by provider if specified
       const filteredModels = provider
-        ? dbModels.filter((m) => m.provider === provider)
+        ? dbModels.filter((m) => m.model.provider === provider)
         : dbModels;
 
-      // Transform to response format with capabilities
-      const models = filteredModels.map((model) => ({
+      // Transform to response format with capabilities and markers
+      const models = filteredModels.map(({ model, isBest, isFastest }) => ({
         id: model.modelId,
         displayName: model.description || model.modelId,
         provider: model.provider,
         capabilities: ModelModel.toCapabilities(model),
+        isBest,
+        isFastest,
       }));
 
       logger.info(
@@ -1209,12 +1157,12 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         }
 
         try {
-          await modelSyncService.syncModelsForApiKey(
-            apiKey.id,
-            apiKey.provider,
-            secretValue ?? "",
-            apiKey.baseUrl,
-          );
+          await modelSyncService.syncModelsForApiKey({
+            apiKeyId: apiKey.id,
+            provider: apiKey.provider,
+            apiKeyValue: secretValue ?? "",
+            baseUrl: apiKey.baseUrl,
+          });
         } catch (error) {
           logger.error(
             {
@@ -1236,6 +1184,82 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
       logger.info(
         { organizationId, apiKeyCount: apiKeys.length },
         "Completed model sync for all API keys (including system keys)",
+      );
+
+      return reply.send({ success: true });
+    },
+  );
+
+  // Full sync: re-fetch models and overwrite ALL fields including user-edited values
+  fastify.post(
+    "/api/chat/models/sync-full",
+    {
+      schema: {
+        operationId: RouteId.SyncChatModelsFull,
+        description:
+          "Sync models from providers, overwriting all fields including custom modifications",
+        tags: ["Chat"],
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ organizationId, user }, reply) => {
+      const userTeamIds = await TeamModel.getUserTeamIds(user.id);
+      const apiKeys = await ChatApiKeyModel.getAvailableKeysForUser(
+        organizationId,
+        user.id,
+        userTeamIds,
+      );
+
+      const syncPromises = apiKeys.map(async (apiKey) => {
+        let secretValue: string | null = null;
+
+        if (apiKey.secretId) {
+          secretValue = (await getSecretValueForLlmProviderApiKey(
+            apiKey.secretId,
+          )) as string | null;
+        }
+
+        if (
+          !secretValue &&
+          !PROVIDERS_WITH_OPTIONAL_API_KEY.has(apiKey.provider)
+        ) {
+          if (apiKey.secretId) {
+            logger.warn(
+              { apiKeyId: apiKey.id, provider: apiKey.provider },
+              "No secret value for API key, skipping sync",
+            );
+          }
+          return;
+        }
+
+        try {
+          await modelSyncService.syncModelsForApiKey({
+            apiKeyId: apiKey.id,
+            provider: apiKey.provider,
+            apiKeyValue: secretValue ?? "",
+            baseUrl: apiKey.baseUrl,
+            forceRefresh: true,
+          });
+        } catch (error) {
+          logger.error(
+            {
+              apiKeyId: apiKey.id,
+              provider: apiKey.provider,
+              errorMessage:
+                error instanceof Error ? error.message : String(error),
+            },
+            "Failed to full-sync models for API key",
+          );
+        }
+      });
+
+      await Promise.all(syncPromises);
+
+      await systemKeyManager.syncSystemKeys(organizationId);
+
+      logger.info(
+        { organizationId, apiKeyCount: apiKeys.length },
+        "Completed full model sync for all API keys (including system keys)",
       );
 
       return reply.send({ success: true });
@@ -1296,19 +1320,19 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
     },
   );
 
-  // Update custom pricing for a model
+  // Update model details (pricing + modalities)
   fastify.patch(
-    "/api/models/:id/pricing",
+    "/api/models/:id",
     {
       schema: {
-        operationId: RouteId.UpdateModelPricing,
+        operationId: RouteId.UpdateModel,
         description:
-          "Update custom pricing for a model. Set prices to null to reset to default pricing.",
+          "Update model details including custom pricing and modalities.",
         tags: ["Models"],
         params: z.object({
           id: UuidIdSchema,
         }),
-        body: UpdateModelPricingSchema,
+        body: PatchModelBodySchema,
         response: constructResponseSchema(SelectModelSchema),
       },
     },
@@ -1318,14 +1342,279 @@ const chatModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Model not found");
       }
 
-      const updated = await ModelModel.updatePricing(id, body);
+      const updated = await ModelModel.update(id, body);
       if (!updated) {
-        throw new ApiError(500, "Failed to update model pricing");
+        throw new ApiError(500, "Failed to update model");
       }
 
       return reply.send(updated);
     },
   );
 };
+
+const VERTEX_GEMINI_EXCLUDE_PATTERNS = [
+  "embedding",
+  "imagen",
+  "text-bison",
+  "code-bison",
+];
+
+const VERTEX_GEMINI_FALLBACK_MODEL_IDS = [
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash-001",
+  "gemini-2.0-flash-lite-001",
+  "gemini-1.5-pro-002",
+  "gemini-1.5-flash-002",
+];
+
+function extractVertexGeminiModel(model: {
+  name?: string | null;
+  displayName?: string | null;
+}): ModelInfo | null {
+  const modelName = model.name ?? "";
+  if (!modelName.includes("gemini")) {
+    return null;
+  }
+
+  const lowerModelName = modelName.toLowerCase();
+  const isExcluded = VERTEX_GEMINI_EXCLUDE_PATTERNS.some((pattern) =>
+    lowerModelName.includes(pattern),
+  );
+  if (isExcluded) {
+    return null;
+  }
+
+  const modelId = modelName.replace("publishers/google/models/", "");
+  return {
+    id: modelId,
+    displayName: model.displayName ?? formatVertexGeminiDisplayName(modelId),
+    provider: "gemini",
+  };
+}
+
+async function fetchVertexGeminiFallbackModels(params: {
+  ai: ReturnType<typeof createGoogleGenAIClient>;
+  existingModelIds: Set<string>;
+  shouldRunFallback: boolean;
+}): Promise<ModelInfo[]> {
+  const { ai, existingModelIds, shouldRunFallback } = params;
+  if (!shouldRunFallback) {
+    return [];
+  }
+
+  const candidateModelIds = VERTEX_GEMINI_FALLBACK_MODEL_IDS.filter(
+    (modelId) => !existingModelIds.has(modelId),
+  );
+
+  logger.info(
+    { candidateCount: candidateModelIds.length },
+    "Vertex AI model list returned incomplete Gemini results, probing fallback model IDs",
+  );
+
+  const results = await Promise.allSettled(
+    candidateModelIds.map(async (modelId) => {
+      const model = await ai.models.get({ model: modelId });
+      return extractVertexGeminiModel({
+        name: model.name,
+        displayName: model.displayName,
+      });
+    }),
+  );
+
+  const validatedModels: ModelInfo[] = [];
+  for (const [index, result] of results.entries()) {
+    const modelId = candidateModelIds[index];
+
+    if (result.status === "fulfilled") {
+      if (result.value) {
+        validatedModels.push(result.value);
+      }
+      continue;
+    }
+
+    logger.debug(
+      {
+        modelId,
+        errorMessage:
+          result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason),
+      },
+      "Vertex AI Gemini fallback candidate unavailable",
+    );
+  }
+
+  logger.info(
+    { validatedCount: validatedModels.length },
+    "Validated Vertex AI Gemini fallback models",
+  );
+
+  return validatedModels;
+}
+
+function dedupeModelsById(models: ModelInfo[]): ModelInfo[] {
+  const deduped = new Map<string, ModelInfo>();
+  for (const model of models) {
+    deduped.set(model.id, model);
+  }
+  return [...deduped.values()];
+}
+
+function formatVertexGeminiDisplayName(modelId: string): string {
+  return modelId
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function isPrimaryVertexGeminiModel(modelId: string): boolean {
+  return (
+    (modelId.includes("flash") || modelId.includes("pro")) &&
+    !modelId.includes("native-audio") &&
+    !modelId.includes("live")
+  );
+}
+
+// ============================================================================
+// Bedrock ListInferenceProfiles helpers
+// ============================================================================
+
+interface BedrockInferenceProfile {
+  inferenceProfileId?: string;
+  inferenceProfileName?: string;
+  description?: string;
+  status?: string;
+  type?: string;
+  models?: Array<{ modelArn?: string }>;
+}
+
+interface BedrockIamSigningParams {
+  region: string;
+  creds: {
+    accessKeyId: string;
+    secretAccessKey: string;
+    sessionToken?: string;
+  };
+}
+
+/**
+ * Fetch all inference profiles from Bedrock, handling pagination.
+ * Supports both Bearer token auth and IAM SigV4 signing.
+ */
+async function fetchAllBedrockInferenceProfiles(
+  controlPlaneUrl: string,
+  headers: Record<string, string>,
+  iamParams?: BedrockIamSigningParams,
+): Promise<BedrockInferenceProfile[]> {
+  const allProfiles: BedrockInferenceProfile[] = [];
+  let nextToken: string | undefined;
+
+  do {
+    const params = new URLSearchParams({ maxResults: "1000" });
+    if (nextToken) {
+      params.set("nextToken", nextToken);
+    }
+    const url = `${controlPlaneUrl}/inference-profiles?${params.toString()}`;
+
+    let response: Response;
+    if (iamParams) {
+      const signer = new AwsV4Signer({
+        url,
+        method: "GET",
+        region: iamParams.region,
+        accessKeyId: iamParams.creds.accessKeyId,
+        secretAccessKey: iamParams.creds.secretAccessKey,
+        sessionToken: iamParams.creds.sessionToken,
+        service: "bedrock",
+      });
+      const signed = await signer.sign();
+      response = await fetch(signed.url, { headers: signed.headers });
+    } else {
+      response = await fetch(url, { headers });
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      const authType = iamParams ? "IAM" : "API key";
+      logger.error(
+        { status: response.status, error: errorText },
+        `Failed to fetch Bedrock inference profiles via ${authType}`,
+      );
+      throw new Error(
+        `Failed to fetch Bedrock inference profiles: ${response.status}`,
+      );
+    }
+
+    const data = (await response.json()) as {
+      inferenceProfileSummaries?: BedrockInferenceProfile[];
+      nextToken?: string;
+    };
+
+    if (data.inferenceProfileSummaries) {
+      allProfiles.push(...data.inferenceProfileSummaries);
+    }
+
+    nextToken = data.nextToken;
+  } while (nextToken);
+
+  logger.info(
+    { profileCount: allProfiles.length },
+    "[fetchBedrockInferenceProfiles] fetched inference profiles",
+  );
+
+  return allProfiles;
+}
+
+/**
+ * Map Bedrock inference profiles to our ModelInfo format.
+ * Uses the inferenceProfileId as the model ID (e.g., "us.anthropic.claude-3-5-sonnet-20241022-v2:0").
+ */
+function mapInferenceProfilesToModels(
+  profiles: BedrockInferenceProfile[],
+): ModelInfo[] {
+  const allowedProviders = config.llm.bedrock.allowedProviders;
+  const allowedRegions = config.llm.bedrock.allowedInferenceRegions;
+
+  const models = profiles
+    .filter((profile) => profile.status === "ACTIVE")
+    .filter((profile) => {
+      if (allowedRegions.length === 0) return true;
+      const id = profile.inferenceProfileId || "";
+      const regionPrefix = id.split(".")[0];
+      return allowedRegions.includes(regionPrefix);
+    })
+    .filter((profile) => {
+      if (allowedProviders.length === 0) return true;
+      // inferenceProfileId format: "us.anthropic.claude-..." or "global.amazon.nova-..."
+      // Strip the region prefix, then check if the provider segment matches
+      const id = profile.inferenceProfileId || "";
+      return allowedProviders.some((provider) => {
+        const withoutRegion = id.replace(/^(us|eu|ap|global)\./, "");
+        return withoutRegion.startsWith(`${provider}.`);
+      });
+    })
+    .map((profile) => ({
+      id: profile.inferenceProfileId || "",
+      displayName:
+        profile.inferenceProfileName || profile.inferenceProfileId || "Unknown",
+      provider: "bedrock" as const,
+    }))
+    .filter((model) => model.id);
+
+  logger.info(
+    {
+      modelCount: models.length,
+      allowedProviders: allowedProviders.length > 0 ? allowedProviders : "all",
+      allowedInferenceRegions:
+        allowedRegions.length > 0 ? allowedRegions : "all",
+      models: models.map((m) => ({ id: m.id, displayName: m.displayName })),
+    },
+    "[fetchBedrockModels] models from inference profiles",
+  );
+
+  return models;
+}
 
 export default chatModelsRoutes;
