@@ -1,5 +1,5 @@
+import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
 import logger from "@/logging";
-import { McpServerRuntimeManager } from "@/mcp-server-runtime";
 import { McpServerModel, ToolModel } from "@/models";
 import type { InternalMcpCatalog, McpServer } from "@/types";
 
@@ -147,6 +147,7 @@ export async function autoReinstallServer(
     name: ToolModel.slugifyName(toolNamePrefix, tool.name),
     description: tool.description,
     parameters: tool.inputSchema,
+    meta: { _meta: tool._meta, annotations: tool.annotations },
     catalogId: catalogItem.id,
     // Pass the raw tool name from MCP server for accurate matching
     // This handles cases where catalog name contains `__` (e.g., huggingface__remote-mcp)

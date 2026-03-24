@@ -2,10 +2,10 @@ import {
   CONTEXT_EXTERNAL_AGENT_ID,
   CONTEXT_TEAM_IDS,
   isAgentTool,
-  isArchestraMcpServerTool,
 } from "@shared";
-import { desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { get } from "lodash-es";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
 import db, { schema } from "@/database";
 import logger from "@/logging";
 import type {
@@ -121,9 +121,10 @@ class ToolInvocationPolicyModel {
 
     const result = await db
       .delete(schema.toolInvocationPoliciesTable)
-      .where(eq(schema.toolInvocationPoliciesTable.id, id));
+      .where(eq(schema.toolInvocationPoliciesTable.id, id))
+      .returning({ id: schema.toolInvocationPoliciesTable.id });
 
-    const deleted = result.rowCount !== null && result.rowCount > 0;
+    const deleted = result.length > 0;
 
     if (deleted) {
       // Clear auto-configured timestamp for this tool
@@ -146,9 +147,10 @@ class ToolInvocationPolicyModel {
   static async deleteByToolId(toolId: string): Promise<number> {
     const result = await db
       .delete(schema.toolInvocationPoliciesTable)
-      .where(eq(schema.toolInvocationPoliciesTable.toolId, toolId));
+      .where(eq(schema.toolInvocationPoliciesTable.toolId, toolId))
+      .returning({ id: schema.toolInvocationPoliciesTable.id });
 
-    return result.rowCount ?? 0;
+    return result.length;
   }
 
   /**
@@ -234,7 +236,7 @@ class ToolInvocationPolicyModel {
     }
 
     // Archestra tools always bypass policies (consistent with evaluateBatch)
-    if (isArchestraMcpServerTool(toolName)) {
+    if (archestraMcpBranding.isToolName(toolName)) {
       return false;
     }
 
@@ -431,7 +433,7 @@ class ToolInvocationPolicyModel {
     // Filter out Archestra tools and agent delegation tools (always allowed)
     const externalToolCalls = toolCalls.filter(
       (tc) =>
-        !isArchestraMcpServerTool(tc.toolCallName) &&
+        !archestraMcpBranding.isToolName(tc.toolCallName) &&
         !isAgentTool(tc.toolCallName),
     );
 
@@ -617,6 +619,44 @@ class ToolInvocationPolicyModel {
     }
 
     return { isAllowed: true, reason: "" };
+  }
+
+  /**
+   * Check if a tool has any policy that could lead to blocking during streaming.
+   * Only `allow_when_context_is_untrusted` with empty conditions ("Allow always")
+   * is safe to stream — any other policy action or custom conditions requires buffering.
+   */
+  static async hasBlockingPolicy(
+    toolName: string,
+    contextIsTrusted: boolean,
+  ): Promise<boolean> {
+    const blockingActions: ToolInvocation.ToolInvocationPolicyAction[] =
+      contextIsTrusted
+        ? ["block_always", "require_approval"]
+        : [
+            "block_always",
+            "require_approval",
+            "block_when_context_is_untrusted",
+          ];
+    const result = await db
+      .select({ id: schema.toolInvocationPoliciesTable.id })
+      .from(schema.toolInvocationPoliciesTable)
+      .innerJoin(
+        schema.toolsTable,
+        eq(schema.toolInvocationPoliciesTable.toolId, schema.toolsTable.id),
+      )
+      .where(
+        and(
+          eq(schema.toolsTable.name, toolName),
+          or(
+            inArray(schema.toolInvocationPoliciesTable.action, blockingActions),
+            sql`jsonb_typeof(${schema.toolInvocationPoliciesTable.conditions}) = 'array' AND jsonb_array_length(${schema.toolInvocationPoliciesTable.conditions}) > 0`,
+          ),
+        ),
+      )
+      .limit(1);
+
+    return result.length > 0;
   }
 }
 

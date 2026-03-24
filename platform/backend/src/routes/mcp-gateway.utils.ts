@@ -1,23 +1,28 @@
 import { createHash } from "node:crypto";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
+  ListPromptsRequestSchema,
+  ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ListToolsRequestSchema,
+  ReadResourceRequestSchema,
   type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
-  AGENT_TOOL_PREFIX,
-  ARCHESTRA_MCP_SERVER_NAME,
   ARCHESTRA_TOKEN_PREFIX,
-  MCP_SERVER_TOOL_NAME_SEPARATOR,
+  isAgentTool,
   OAUTH_TOKEN_ID_PREFIX,
   parseFullToolName,
+  TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
 } from "@shared";
 import { eq } from "drizzle-orm";
 import type { FastifyRequest } from "fastify";
 import {
+  archestraMcpBranding,
   executeArchestraTool,
+  filterToolNamesByPermission,
   getArchestraMcpTools,
 } from "@/archestra-mcp-server";
 import { userHasPermission } from "@/auth/utils";
@@ -26,8 +31,12 @@ import config from "@/config";
 import db, { schema as dbSchema } from "@/database";
 import logger from "@/logging";
 import {
+  AgentConnectorAssignmentModel,
+  AgentKnowledgeBaseModel,
   AgentModel,
   AgentTeamModel,
+  KnowledgeBaseConnectorModel,
+  KnowledgeBaseModel,
   McpToolCallModel,
   MemberModel,
   OAuthAccessTokenModel,
@@ -67,38 +76,49 @@ export interface TokenAuthResult {
   rawToken?: string;
 }
 
-/**
- * Create a fresh MCP server for a request
- * In stateless mode, we need to create new server instances per request
- */
-type AgentInfo = {
+export type AgentInfo = {
   name: string;
   id: string;
   agentType?: AgentType;
   labels?: Array<{ key: string; value: string }>;
 };
 
+/**
+ * Creates an MCP server for the given agent.
+ * Pass `preloadedAgent` (e.g. from the proxy's access cache) to skip the
+ * redundant DB lookup that would otherwise happen inside this function.
+ */
 export async function createAgentServer(
   agentId: string,
   tokenAuth?: TokenAuthContext,
-): Promise<{ server: Server; agent: AgentInfo }> {
-  const server = new Server(
+  preloadedAgent?: AgentInfo,
+): Promise<{ server: McpServer; agent: AgentInfo }> {
+  const mcpServer = new McpServer(
     {
       name: `archestra-agent-${agentId}`,
       version: config.api.version,
     },
     {
       capabilities: {
+        resources: {
+          subscribe: true,
+          listChanged: true,
+        },
+        prompts: {},
         tools: { listChanged: false },
       },
     },
   );
+  const { server } = mcpServer;
 
-  const fetchedAgent = await AgentModel.findById(agentId);
-  if (!fetchedAgent) {
-    throw new Error(`Agent not found: ${agentId}`);
+  let agent: AgentInfo;
+  if (preloadedAgent) {
+    agent = preloadedAgent;
+  } else {
+    const fetched = await AgentModel.findById(agentId);
+    if (!fetched) throw new Error(`Agent not found: ${agentId}`);
+    agent = fetched;
   }
-  const agent = fetchedAgent;
 
   // Create a map of Archestra tool names to their titles
   // This is needed because the database schema doesn't include a title field
@@ -113,14 +133,34 @@ export async function createAgentServer(
     // Fetch fresh on every request to ensure we get newly assigned tools
     const mcpTools = await ToolModel.getMcpToolsByAgent(agentId);
 
-    const toolsList = mcpTools.map(({ name, description, parameters }) => ({
-      name,
-      title: archestraToolTitles.get(name) || name,
-      description,
-      inputSchema: parameters,
-      annotations: {},
-      _meta: {},
-    }));
+    // Filter Archestra tools based on user RBAC permissions
+    const permittedNames = await filterToolNamesByPermission(
+      mcpTools.map((t) => t.name),
+      tokenAuth?.userId,
+      tokenAuth?.organizationId,
+    );
+    const permittedTools = mcpTools.filter((t) => permittedNames.has(t.name));
+
+    // Dynamically enrich the knowledge sources tool description with
+    // the agent's actual knowledge base names and connector types
+    const kbToolDescription = await buildKnowledgeSourcesDescription(agentId);
+
+    const toolsList = permittedTools.map(
+      ({ name, description, parameters, meta }) => ({
+        name,
+        title: archestraToolTitles.get(name) || name,
+        description:
+          name ===
+            archestraMcpBranding.getToolName(
+              TOOL_QUERY_KNOWLEDGE_SOURCES_SHORT_NAME,
+            ) && kbToolDescription
+            ? kbToolDescription
+            : description,
+        inputSchema: parameters,
+        annotations: meta?.annotations || {},
+        _meta: meta?._meta || {},
+      }),
+    );
 
     // Log tools/list request
     try {
@@ -136,13 +176,60 @@ export async function createAgentServer(
       });
       logger.info(
         { agentId, toolsCount: toolsList.length },
-        "✅ Saved tools/list request",
+        "Saved tools/list request",
       );
     } catch (dbError) {
       logger.warn({ err: dbError }, "Failed to persist tools/list request:");
     }
 
     return { tools: toolsList };
+  });
+
+  server.setRequestHandler(
+    ReadResourceRequestSchema,
+    async ({ params: { uri } }) => {
+      try {
+        logger.info(
+          { agentId, uri },
+          "MCP gateway read resource request received",
+        );
+        const result = await mcpClient.readResource(uri, agentId, tokenAuth);
+        logger.info(
+          { agentId, uri, resultType: typeof result },
+          "Resource read successful",
+        );
+        return result;
+      } catch (error) {
+        logger.error(
+          {
+            agentId,
+            uri,
+            error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+          "Resource read failed",
+        );
+        throw {
+          code: -32603,
+          message: "Resource read failed",
+          data: error instanceof Error ? error.message : "Unknown error",
+        };
+      }
+    },
+  );
+
+  // SEP-1865: resources/list, resources/templates/list, prompts/list
+  // Proxy to all upstream MCP servers connected to this agent and aggregate results.
+  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+    return mcpClient.listResources(agentId);
+  });
+
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+    return mcpClient.listResourceTemplates(agentId);
+  });
+
+  server.setRequestHandler(ListPromptsRequestSchema, async () => {
+    return mcpClient.listPrompts(agentId);
   });
 
   server.setRequestHandler(
@@ -170,18 +257,19 @@ export async function createAgentServer(
 
       try {
         // Check if this is an Archestra tool or agent delegation tool
-        const archestraToolPrefix = `${ARCHESTRA_MCP_SERVER_NAME}${MCP_SERVER_TOOL_NAME_SEPARATOR}`;
-        const isArchestraTool = name.startsWith(archestraToolPrefix);
-        const isAgentTool = name.startsWith(AGENT_TOOL_PREFIX);
+        const isArchestraTool = archestraMcpBranding.isToolName(name);
+        const isAgentDelegationTool = isAgentTool(name);
 
-        if (isArchestraTool || isAgentTool) {
+        if (isArchestraTool || isAgentDelegationTool) {
           logger.info(
             {
               agentId,
               toolName: name,
-              toolType: isAgentTool ? "agent-delegation" : "archestra",
+              toolType: isAgentDelegationTool
+                ? "agent-delegation"
+                : "archestra",
             },
-            isAgentTool
+            isAgentDelegationTool
               ? "Agent delegation tool call received"
               : "Archestra MCP tool call received",
           );
@@ -214,7 +302,7 @@ export async function createAgentServer(
           metrics.mcp.reportMcpToolCall({
             agentId: agent.id,
             agentName: agent.name,
-            agentType: agent.agentType,
+            agentType: agent.agentType ?? null,
             mcpServerName,
             toolName: name,
             durationSeconds,
@@ -231,7 +319,7 @@ export async function createAgentServer(
               agentId,
               toolName: name,
             },
-            isAgentTool
+            isAgentDelegationTool
               ? "Agent delegation tool call completed"
               : "Archestra MCP tool call completed",
           );
@@ -240,7 +328,7 @@ export async function createAgentServer(
           try {
             await McpToolCallModel.create({
               agentId,
-              mcpServerName: ARCHESTRA_MCP_SERVER_NAME,
+              mcpServerName: archestraMcpBranding.serverName,
               method: "tools/call",
               toolCall: {
                 id: `archestra-${Date.now()}`,
@@ -305,7 +393,7 @@ export async function createAgentServer(
         metrics.mcp.reportMcpToolCall({
           agentId: agent.id,
           agentName: agent.name,
-          agentType: agent.agentType,
+          agentType: agent.agentType ?? null,
           mcpServerName,
           toolName: name,
           durationSeconds,
@@ -339,13 +427,15 @@ export async function createAgentServer(
             ? result.content
             : [{ type: "text", text: JSON.stringify(result.content) }],
           isError: result.isError,
+          _meta: result._meta,
+          structuredContent: result.structuredContent,
         };
       } catch (error) {
         const durationSeconds = (Date.now() - startTime) / 1000;
         metrics.mcp.reportMcpToolCall({
           agentId: agent.id,
           agentName: agent.name,
-          agentType: agent.agentType,
+          agentType: agent.agentType ?? null,
           mcpServerName,
           toolName: name,
           durationSeconds,
@@ -368,7 +458,7 @@ export async function createAgentServer(
   );
 
   logger.info({ agentId }, "MCP server instance created");
-  return { server, agent };
+  return { server: mcpServer, agent };
 }
 
 /**
@@ -965,4 +1055,85 @@ async function fetchOidcJwksUrl(issuerUrl: string): Promise<string | null> {
     );
     return null;
   }
+}
+
+/**
+ * TTL cache for buildKnowledgeSourcesDescription to avoid repeated DB queries
+ * on every tools/list request. Invalidated after 30 seconds.
+ */
+const kbDescriptionCache = new Map<
+  string,
+  { description: string | null; expiresAt: number }
+>();
+const KB_DESCRIPTION_CACHE_TTL_MS = 30_000;
+
+/**
+ * Build a dynamic description for the query_knowledge_sources tool that includes
+ * the agent's actual knowledge base names and connector sources.
+ * Results are cached per agentId with a 30s TTL.
+ */
+export async function buildKnowledgeSourcesDescription(
+  agentId: string,
+): Promise<string | null> {
+  const cached = kbDescriptionCache.get(agentId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.description;
+  }
+
+  const [kbAssignments, directConnectorIds] = await Promise.all([
+    AgentKnowledgeBaseModel.findByAgent(agentId),
+    AgentConnectorAssignmentModel.getConnectorIds(agentId),
+  ]);
+
+  if (kbAssignments.length === 0 && directConnectorIds.length === 0) {
+    kbDescriptionCache.set(agentId, {
+      description: null,
+      expiresAt: Date.now() + KB_DESCRIPTION_CACHE_TTL_MS,
+    });
+    return null;
+  }
+
+  const kbIds = kbAssignments.map((a) => a.knowledgeBaseId);
+
+  const [knowledgeBases, kbConnectors, directConnectors] = await Promise.all([
+    kbIds.length > 0 ? KnowledgeBaseModel.findByIds(kbIds) : [],
+    kbIds.length > 0
+      ? KnowledgeBaseConnectorModel.findByKnowledgeBaseIds(kbIds)
+      : [],
+    KnowledgeBaseConnectorModel.findByIds(directConnectorIds),
+  ]);
+
+  const kbNames = knowledgeBases.map((kb) => kb.name);
+  const allConnectors = [...kbConnectors, ...directConnectors];
+  const connectorTypes = [
+    ...new Set(allConnectors.map((c) => c.connectorType)),
+  ];
+
+  let description =
+    "Query the organization's knowledge sources to retrieve relevant information. " +
+    "Use this tool when the user asks a question you cannot answer from your training data alone, " +
+    "or when they explicitly ask you to search internal documents and data sources. " +
+    "Pass the user's original query as-is — do not rephrase, summarize, or expand it. " +
+    "The system performs its own query optimization internally.";
+
+  if (kbNames.length > 0) {
+    const kbList = kbNames.join(", ");
+    description +=
+      kbList.length > 500
+        ? ` Available knowledge bases: ${kbList.slice(0, 500)}...`
+        : ` Available knowledge bases: ${kbList}.`;
+  }
+  if (connectorTypes.length > 0) {
+    description += ` Connected sources: ${connectorTypes.join(", ")}.`;
+  }
+
+  description +=
+    " Pass the user's original query verbatim — the system handles query optimization internally.";
+
+  kbDescriptionCache.set(agentId, {
+    description,
+    expiresAt: Date.now() + KB_DESCRIPTION_CACHE_TTL_MS,
+  });
+
+  return description;
 }

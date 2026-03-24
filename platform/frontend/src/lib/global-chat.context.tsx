@@ -92,6 +92,23 @@ interface ChatSession {
   ) => void;
   /** Token usage for the current/last response */
   tokenUsage: TokenUsage | null;
+  /** Early UI data from data-tool-ui-start events (toolCallId → resource data incl. pre-fetched HTML) */
+  earlyToolUiStarts: Record<
+    string,
+    {
+      uiResourceUri: string;
+      html?: string;
+      csp?: { connectDomains?: string[]; resourceDomains?: string[] };
+      permissions?: {
+        camera?: boolean;
+        microphone?: boolean;
+        geolocation?: boolean;
+        clipboardWrite?: boolean;
+      };
+      /** Stored to identify PREFETCH entries where the key equals toolName */
+      toolName?: string;
+    }
+  >;
 }
 
 interface ChatContextValue {
@@ -291,7 +308,12 @@ function ChatSessionHook({
   // Auto-retry state for transient errors
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const prevUserMessagesLenRef = useRef(0);
+  const prevMessagesLenRef = useRef(0);
+
+  // Track early UI data from data-tool-ui-start events (toolCallId → resource data)
+  const [earlyToolUiStarts, setEarlyToolUiStarts] = useState<
+    ChatSession["earlyToolUiStarts"]
+  >({});
 
   const {
     messages,
@@ -336,6 +358,9 @@ function ChatSessionHook({
           });
         }, 100);
       }
+
+      // Free early UI HTML blobs now that all tool calls have rendered.
+      setEarlyToolUiStarts({});
 
       // Attempt to generate title after first assistant response
       // This will be checked when messages update in the effect below
@@ -435,6 +460,26 @@ function ChatSessionHook({
         const usage = dataPart.data as TokenUsage;
         setTokenUsage(usage);
       }
+
+      // Handle data-tool-ui-start: backend emits this when a tool call starts streaming,
+      // so the frontend can render the MCP App container immediately (before tool finishes)
+      const customData = dataPart as unknown as {
+        type?: string;
+        data?: ChatSession["earlyToolUiStarts"][string] & {
+          toolCallId?: string;
+          toolName?: string;
+        };
+      };
+      if (customData.type === "data-tool-ui-start") {
+        const { toolCallId, toolName, uiResourceUri, html, csp, permissions } =
+          customData.data ?? {};
+        if (toolCallId && uiResourceUri) {
+          setEarlyToolUiStarts((prev) => ({
+            ...prev,
+            [toolCallId]: { uiResourceUri, html, csp, permissions, toolName },
+          }));
+        }
+      }
     },
     sendAutomaticallyWhen: ({ messages: msgs }) => {
       // Don't auto-resubmit after swap_agent — the poke in onFinish handles it
@@ -450,11 +495,10 @@ function ChatSessionHook({
 
   // Reset retry counter when a new user message is sent (messages array grows).
   // regenerate() doesn't add messages, so this won't reset during retries.
-  const userMessagesCount = messages.filter((m) => m.role === "user").length;
-  if (userMessagesCount > prevUserMessagesLenRef.current) {
+  if (messages.length > prevMessagesLenRef.current) {
     retryCountRef.current = 0;
   }
-  prevUserMessagesLenRef.current = userMessagesCount;
+  prevMessagesLenRef.current = messages.length;
 
   useEffect(() => {
     if (optimisticToolCalls.length === 0) {
@@ -517,6 +561,7 @@ function ChatSessionHook({
     optimisticToolCalls,
     setPendingCustomServerToolCall,
     tokenUsage,
+    earlyToolUiStarts,
   };
 
   // Sync to the shared sessions map and notify consumers.
@@ -539,6 +584,7 @@ function ChatSessionHook({
     pendingCustomServerToolCall,
     optimisticToolCalls,
     tokenUsage,
+    earlyToolUiStarts,
     sessionsRef,
     notifySessionUpdate,
   ]);

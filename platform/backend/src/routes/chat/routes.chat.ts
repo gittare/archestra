@@ -11,15 +11,22 @@ import {
   createUIMessageStream,
   createUIMessageStreamResponse,
   generateText,
+  hasToolCall,
   stepCountIs,
   streamText,
   type UIMessage,
 } from "ai";
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
+import { archestraMcpBranding } from "@/archestra-mcp-server";
 import { hasAnyAgentTypeAdminPermission } from "@/auth";
 import { CacheKey, cacheManager } from "@/cache-manager";
-import { getChatMcpTools } from "@/clients/chat-mcp-client";
+import {
+  fetchToolUiResource,
+  getChatMcpTools,
+  getChatMcpToolUiResourceUris,
+  type ToolUiResourceData,
+} from "@/clients/chat-mcp-client";
 import {
   createDirectLLMModel,
   createLLMModelForAgent,
@@ -29,7 +36,7 @@ import {
 } from "@/clients/llm-client";
 import config from "@/config";
 import { browserStreamFeature } from "@/features/browser-stream/services/browser-stream.feature";
-import { extractAndIngestDocuments } from "@/knowledge-graph/chat-document-extractor";
+import { extractAndIngestDocuments } from "@/knowledge-base";
 import logger from "@/logging";
 import {
   AgentModel,
@@ -40,8 +47,15 @@ import {
   TeamModel,
 } from "@/models";
 import { startActiveChatSpan } from "@/observability/tracing";
+import { resolveConversationLlmSelectionForAgent } from "@/services/conversation-llm-selection";
+import {
+  promptNeedsRendering,
+  renderSystemPrompt,
+  type SystemPromptContext,
+} from "@/templating";
 import {
   ApiError,
+  type ChatMessage,
   constructResponseSchema,
   DeleteObjectResponseSchema,
   ErrorResponsesSchema,
@@ -56,11 +70,17 @@ import {
   resolveSmartDefaultLlmForChat,
 } from "@/utils/llm-resolution";
 import { estimateMessagesSize } from "@/utils/message-size";
-import { mapProviderError, ProviderError } from "./errors";
 import {
-  stripImagesFromMessages,
-  type UiMessage,
-} from "./strip-images-from-messages";
+  parseMaxInputTokens,
+  shouldProbeTextStreamForContextTrimRetry,
+  trimMessagesToTokenLimit,
+} from "./context-trimming";
+import {
+  getActiveTraceContext,
+  mapProviderError,
+  ProviderError,
+} from "./errors";
+import { normalizeChatMessages } from "./normalization/normalize-chat-messages";
 
 const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.post(
@@ -119,15 +139,6 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
         conversationId,
       });
 
-      // Extract and ingest documents to knowledge graph (fire and forget)
-      // This runs asynchronously to avoid blocking the chat response
-      extractAndIngestDocuments(messages).catch((error) => {
-        logger.warn(
-          { error: error instanceof Error ? error.message : String(error) },
-          "[Chat] Background document ingestion failed",
-        );
-      });
-
       const userIsAgentAdmin = await hasAnyAgentTypeAdminPermission({
         userId: user.id,
         organizationId,
@@ -154,6 +165,15 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       const { agentId, agent } = conversation;
 
+      // Extract and ingest documents to agent's knowledge base (fire and forget)
+      // This runs asynchronously to avoid blocking the chat response
+      extractAndIngestDocuments(messages, agentId).catch((error) => {
+        logger.warn(
+          { error: error instanceof Error ? error.message : String(error) },
+          "[Chat] Background document ingestion failed",
+        );
+      });
+
       const externalAgentId = agentId;
 
       // Fetch enabled tool IDs and custom selection status in parallel
@@ -165,45 +185,60 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // Fetch MCP tools with enabled tool filtering
       // Pass undefined if no custom selection (use all tools)
       // Pass the actual array (even if empty) if there is custom selection
-      const mcpTools = await getChatMcpTools({
-        agentName: agent.name,
-        agentId,
-        userId: user.id,
-        userIsAgentAdmin,
-        enabledToolIds: hasCustomSelection ? enabledToolIds : undefined,
-        conversationId: conversation.id,
-        organizationId,
-        // Pass conversationId as sessionId to group all chat requests (including delegated agents) together
-        sessionId: conversation.id,
-        // Pass agentId as initial delegation chain (will be extended by delegated agents)
-        delegationChain: agentId,
-        abortSignal: chatAbortController.signal,
-        user: { id: user.id, email: user.email, name: user.name },
-      });
+      const [mcpTools, toolUiResourceUris] = await Promise.all([
+        getChatMcpTools({
+          agentName: agent.name,
+          agentId,
+          userId: user.id,
+          userIsAgentAdmin,
+          enabledToolIds: hasCustomSelection ? enabledToolIds : undefined,
+          conversationId: conversation.id,
+          organizationId,
+          // Pass conversationId as sessionId to group all chat requests (including delegated agents) together
+          sessionId: conversation.id,
+          // Pass agentId as initial delegation chain (will be extended by delegated agents)
+          delegationChain: agentId,
+          abortSignal: chatAbortController.signal,
+          user: { id: user.id, email: user.email, name: user.name },
+        }),
+        getChatMcpToolUiResourceUris(conversation.agentId),
+      ]);
 
-      // Build system prompt from agent's systemPrompt and userPrompt fields
+      // Build system prompt from agent's systemPrompt field
       let systemPrompt: string | undefined;
-      const systemPromptParts: string[] = [];
-      const userPromptParts: string[] = [];
 
-      // Collect system and user prompts from the agent
-      if (agent.systemPrompt) {
-        systemPromptParts.push(agent.systemPrompt);
-      }
-      if (agent.userPrompt) {
-        userPromptParts.push(agent.userPrompt);
+      // Build template context only when prompts use Handlebars syntax
+      let promptContext: SystemPromptContext | null = null;
+      if (promptNeedsRendering(agent.systemPrompt)) {
+        const userTeams = await TeamModel.getUserTeams(user.id);
+        promptContext = {
+          user: {
+            name: user.name,
+            email: user.email,
+            teams: userTeams.map((t) => t.name),
+          },
+        };
       }
 
-      // Add instruction about tool approval denials
-      systemPromptParts.push(
-        "When a tool execution is not approved by the user, do not retry it. Explain what happened and ask the user what they'd like to do instead.",
+      const renderedPrompt = renderSystemPrompt(
+        agent.systemPrompt,
+        promptContext,
       );
 
-      // Combine all prompts into system prompt (system prompts first, then user prompts)
-      if (systemPromptParts.length > 0 || userPromptParts.length > 0) {
-        const allParts = [...systemPromptParts, ...userPromptParts];
-        systemPrompt = allParts.join("\n\n");
+      let toolResultInstructions: string;
+      // Add MCP UI instruction when tools are available
+      if (Object.keys(mcpTools).length > 0) {
+        toolResultInstructions =
+          "When a tool result includes a UI resource, it means an interactive UI was rendered for the user. Respond with at most one brief sentence. Never describe, list, or explain what the UI shows.";
       }
+
+      const toolDenialInstruction =
+        "When a tool execution is not approved by the user, do not retry it. Explain what happened and ask the user what they'd like to do instead.";
+
+      systemPrompt =
+        [renderedPrompt, toolDenialInstruction, toolResultInstructions]
+          .filter(Boolean)
+          .join("\n\n") || undefined;
 
       // Use stored provider if available, otherwise detect from model name for backward compatibility
       // At the moment of migration, all supported providers (anthropic, openai, gemini) serve different models,
@@ -224,9 +259,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
           model: conversation.selectedModel,
           provider,
           providerSource: conversation.selectedProvider ? "stored" : "detected",
-          hasSystemPromptParts: systemPromptParts.length > 0,
-          hasUserPromptParts: userPromptParts.length > 0,
-          systemPromptProvided: !!systemPrompt,
+          hasSystemPrompt: !!systemPrompt,
           externalAgentId,
         },
         "Starting chat stream",
@@ -256,17 +289,18 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             agentLlmApiKeyId: agent.llmApiKeyId,
           });
 
-          // Strip images and large browser tool results from messages before sending to LLM
-          // This prevents context limit issues from accumulated screenshots and page snapshots
-          const strippedMessagesForLLM = stripImagesFromMessages(
-            messages as UiMessage[],
+          // Normalize chat history before replaying it to the model.
+          // This dedupes repeated tool parts, drops dangling interrupted tool calls,
+          // and strips heavy image/browser payloads that would otherwise bloat context.
+          const normalizedMessagesForLLM = normalizeChatMessages(
+            messages as ChatMessage[],
           );
 
           // Stream with AI SDK
           // Build streamText config conditionally
-          // Cast to UIMessage[] - UiMessage is structurally compatible at runtime
+          // Cast to UIMessage[] - ChatMessage is structurally compatible at runtime
           const modelMessages = await convertToModelMessages(
-            strippedMessagesForLLM as unknown as Omit<UIMessage, "id">[],
+            normalizedMessagesForLLM as unknown as Omit<UIMessage, "id">[],
           );
 
           // Perplexity does NOT support tool calling - it has built-in web search instead
@@ -277,7 +311,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             model,
             messages: modelMessages,
             ...(supportsToolCalling && { tools: mcpTools }),
-            stopWhen: stepCountIs(500),
+            stopWhen: buildChatStopConditions(),
             abortSignal: chatAbortController.signal,
             onFinish: async ({ usage, finishReason }) => {
               removeAbortListeners();
@@ -322,6 +356,20 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
             };
           }
 
+          // Persist user's new messages immediately so they're visible on page reload.
+          // Without this, a reload during streaming shows no messages because
+          // onFinish hasn't fired yet. persistNewMessages is idempotent — it only
+          // saves messages beyond the existing count, so onFinish will only save
+          // the assistant response.
+          try {
+            await persistNewMessages(conversationId, messages, "earlyUserMsg");
+          } catch (error) {
+            logger.warn(
+              { error, conversationId },
+              "Failed to persist user messages early (will retry in onFinish)",
+            );
+          }
+
           // Create stream with token usage data support
           const response = createUIMessageStreamResponse({
             headers: {
@@ -330,15 +378,220 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
               "Content-Encoding": "none",
             },
             stream: createUIMessageStream({
-              execute: async ({ writer }) => {
-                const result = streamText(streamTextConfig);
+              // Preserve incoming message IDs so the client updates existing
+              // assistant messages instead of rendering duplicate ones.
+              originalMessages: messages as UIMessage[],
+              onError: (error) => {
+                // Persist messages on stream-level errors (e.g. errors thrown
+                // in execute before writer.merge() is reached). Without this,
+                // user messages are lost on refresh after an error.
+                const shouldPersist = !messagesPersisted && !!conversationId;
+                if (shouldPersist) {
+                  messagesPersisted = true;
+                }
+                (async () => {
+                  if (shouldPersist) {
+                    try {
+                      await persistNewMessages(
+                        conversationId,
+                        messages,
+                        "onStreamError",
+                      );
+                    } catch (persistError) {
+                      logger.error(
+                        { persistError, conversationId },
+                        "Failed to persist messages during stream error",
+                      );
+                    }
+                  }
+                })().catch((err) => {
+                  logger.error(
+                    { err },
+                    "Unexpected error in onError async persist handler",
+                  );
+                });
 
-                // Merge the stream text result into the UI message stream
+                const mapped = mapProviderError(error, provider);
+                const traceCtx = getActiveTraceContext();
+                try {
+                  return JSON.stringify({ ...mapped, ...traceCtx });
+                } catch {
+                  return JSON.stringify({
+                    code: mapped.code,
+                    message: mapped.message,
+                    isRetryable: mapped.isRetryable,
+                    ...traceCtx,
+                  });
+                }
+              },
+              execute: async ({ writer }) => {
+                // Prefetch all UI resources eagerly before streaming starts
+                // so onChunk can write data-tool-ui-start synchronously.
+                // Even with LRU caching, .then() on a resolved promise runs
+                // as a microtask — the stream processes more chunks before
+                // the microtask fires, causing data-tool-ui-start to arrive
+                // after all tool deltas instead of right after tool-input-start.
+                const MAX_SSE_HTML_BYTES = 1024 * 1024;
+                const prefetchedUiResources = new Map<
+                  string,
+                  ToolUiResourceData
+                >();
+                if (
+                  conversation.agentId &&
+                  Object.keys(toolUiResourceUris).length > 0
+                ) {
+                  await Promise.all(
+                    Object.entries(toolUiResourceUris).map(
+                      async ([toolName, uri]) => {
+                        try {
+                          const resource = await fetchToolUiResource({
+                            agentId: conversation.agentId!,
+                            userId: user.id,
+                            organizationId,
+                            userIsAgentAdmin,
+                            conversationId: conversation.id,
+                            toolName,
+                            uri,
+                          });
+                          if (resource) {
+                            const html =
+                              resource.html &&
+                              Buffer.byteLength(resource.html) <=
+                                MAX_SSE_HTML_BYTES
+                                ? resource.html
+                                : undefined;
+                            prefetchedUiResources.set(toolName, {
+                              ...resource,
+                              html,
+                            });
+                          }
+                        } catch (err) {
+                          logger.debug(
+                            { err, toolName },
+                            "Failed to prefetch UI resource",
+                          );
+                        }
+                      },
+                    ),
+                  );
+                }
+
+                // Emit data-tool-ui-start synchronously in onChunk so it
+                // arrives right after tool-input-start, before any deltas.
+                streamTextConfig.onChunk = ({ chunk }) => {
+                  if (chunk.type === "tool-input-start" && chunk.toolName) {
+                    const prefetched = prefetchedUiResources.get(
+                      chunk.toolName,
+                    );
+                    if (prefetched) {
+                      writer.write({
+                        type: "data-tool-ui-start",
+                        data: {
+                          toolCallId: chunk.id,
+                          toolName: chunk.toolName,
+                          uiResourceUri: toolUiResourceUris[chunk.toolName],
+                          html: prefetched.html,
+                          csp: prefetched.csp,
+                          permissions: prefetched.permissions,
+                        },
+                      });
+                    }
+                  }
+                };
+
+                // ⚠️ TEMPORARY: Error injection for testing retries. Remove after testing.
+                const lastMsg = (
+                  messages as { parts?: { type: string; text?: string }[] }[]
+                ).at(-1);
+                const lastText =
+                  lastMsg?.parts?.find((p) => p.type === "text")?.text ?? "";
+                if (lastText.includes("__test_500")) {
+                  throw new Error("Simulated server error (500)");
+                }
+                if (lastText.includes("__test_network")) {
+                  throw new TypeError("Failed to fetch");
+                }
+                if (lastText.includes("__test_no_output")) {
+                  throw new Error(
+                    "No output generated. Check the stream for errors.",
+                  );
+                }
+
+                // Stream tokens to the client in real-time while also
+                // handling context-length errors from vLLM/LiteLLM.
+                //
+                // Context-length errors (400) are rejected by the provider
+                // before any tokens are emitted. We detect this by reading
+                // the first chunk from textStream — if the provider rejects,
+                // the iterator throws immediately. We then parse the error,
+                // trim messages, and retry with a new streamText call.
+                //
+                // For successful requests, the first chunk arrives quickly
+                // and we proceed to merge the full stream to the client.
+                let result = streamText(streamTextConfig);
+
+                // Try reading the first text chunk to detect immediate provider errors.
+                // Context-length errors fire before any tokens, so this catches them
+                // without blocking normal streaming (first token arrives in ~100-500ms).
+                if (shouldProbeTextStreamForContextTrimRetry(provider)) {
+                  try {
+                    const reader = result.textStream[Symbol.asyncIterator]();
+                    await reader.next();
+                  } catch (error) {
+                    const maxTokens = parseMaxInputTokens(error);
+                    if (maxTokens !== null) {
+                      const trimmed = trimMessagesToTokenLimit(
+                        modelMessages,
+                        maxTokens,
+                      );
+                      logger.info(
+                        {
+                          maxTokens,
+                          originalMessages: modelMessages.length,
+                          trimmedMessages: trimmed.length,
+                          conversationId,
+                        },
+                        "[ContextTrimming] retrying with trimmed messages",
+                      );
+                      result = streamText({
+                        ...streamTextConfig,
+                        messages: trimmed,
+                      });
+                    } else {
+                      // Save messages before throwing — this error path runs before
+                      // writer.merge(), so onError/onFinish callbacks won't fire.
+                      if (!messagesPersisted && conversationId) {
+                        messagesPersisted = true;
+                        try {
+                          await persistNewMessages(
+                            conversationId,
+                            messages,
+                            "onExecuteError",
+                          );
+                        } catch (persistError) {
+                          logger.error(
+                            { persistError, conversationId },
+                            "Failed to persist messages during execute error",
+                          );
+                        }
+                      }
+                      throw error;
+                    }
+                  }
+                }
+
                 writer.merge(
                   result.toUIMessageStream({
                     originalMessages: messages as UIMessage[],
                     onError: (error) => {
-                      // Use an async IIFE to handle async operations within the sync onError handler
+                      // Claim persistence before the async work below starts,
+                      // otherwise onFinish can race and also persist (duplicates).
+                      const shouldPersist =
+                        !messagesPersisted && !!conversationId;
+                      if (shouldPersist) {
+                        messagesPersisted = true;
+                      }
+
                       (async () => {
                         logger.error(
                           {
@@ -350,15 +603,13 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                         );
 
                         // Persist messages despite error so they have a valid ID for editing
-                        // Only persist if not already persisted by onFinish
-                        if (!messagesPersisted && conversationId) {
+                        if (shouldPersist) {
                           try {
                             await persistNewMessages(
                               conversationId,
                               messages,
                               "onError",
                             );
-                            messagesPersisted = true;
                           } catch (persistError) {
                             // Log persistence error but don't prevent the error response
                             logger.error(
@@ -381,6 +632,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                         error instanceof ProviderError
                           ? error.chatErrorResponse
                           : mapProviderError(error, provider);
+                      const traceCtx = getActiveTraceContext();
 
                       logger.info(
                         {
@@ -394,7 +646,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
                       // mapProviderError safely serializes raw errors, but add defensive try-catch
                       try {
-                        return JSON.stringify(mappedError);
+                        return JSON.stringify({ ...mappedError, ...traceCtx });
                       } catch (stringifyError) {
                         logger.error(
                           { stringifyError, errorCode: mappedError.code },
@@ -405,6 +657,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                           code: mappedError.code,
                           message: mappedError.message,
                           isRetryable: mappedError.isRetryable,
+                          ...traceCtx,
                         });
                       }
                     },
@@ -431,8 +684,14 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   }),
                 );
 
-                // Wait for the stream to complete and get usage data
-                const usage = await result.usage;
+                // Wait for the stream to complete and get usage data.
+                // Catch NoOutputGeneratedError (thrown when provider errors
+                // prevent any output) to avoid emitting a second, generic
+                // error event that would race with the detailed provider error
+                // already flowing through toUIMessageStream's onError.
+                const usage = await Promise.resolve(result.usage).catch(
+                  () => null,
+                );
 
                 // Write token usage data to the stream as a custom data part
                 if (usage) {
@@ -765,6 +1024,25 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
         if (!agent) {
           throw new ApiError(404, "Agent not found");
         }
+
+        if (
+          body.selectedModel === undefined &&
+          body.selectedProvider === undefined &&
+          body.chatApiKeyId === undefined
+        ) {
+          const llmSelection = await resolveConversationLlmSelectionForAgent({
+            agent: {
+              llmApiKeyId: agent.llmApiKeyId ?? null,
+              llmModel: agent.llmModel ?? null,
+            },
+            organizationId,
+            userId: user.id,
+          });
+
+          body.selectedModel = llmSelection.selectedModel;
+          body.selectedProvider = llmSelection.selectedProvider;
+          body.chatApiKeyId = llmSelection.chatApiKeyId;
+        }
       }
 
       // Coerce pinnedAt ISO string to Date for database storage
@@ -980,7 +1258,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
         operationId: RouteId.UpdateChatMessage,
         description: "Update a specific text part in a message",
         tags: ["Chat"],
-        params: z.object({ id: UuidIdSchema }),
+        params: z.object({ id: z.string() }),
         body: z.object({
           partIndex: z.number().int().min(0),
           text: z.string().min(1),
@@ -999,7 +1277,9 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       reply,
     ) => {
       // Fetch the message to get its conversation ID
-      const message = await MessageModel.findById(id);
+      // Use findByAnyId to support both DB UUIDs and AI SDK nanoid content IDs
+      // (in-session messages retain their nanoid IDs until page reload)
+      const message = await MessageModel.findByAnyId(id);
 
       if (!message) {
         throw new ApiError(404, "Message not found");
@@ -1021,7 +1301,7 @@ const chatRoutes: FastifyPluginAsyncZod = async (fastify) => {
       // preventing inconsistent state where message is updated but subsequent
       // messages remain when they should have been deleted
       await MessageModel.updateTextPartAndDeleteSubsequent(
-        id,
+        message.id,
         partIndex,
         text,
         deleteSubsequentMessages ?? false,
@@ -1218,6 +1498,23 @@ export function extractFirstMessages(messages: unknown[]): ExtractedMessages {
   return { firstUserMessage, firstAssistantMessage };
 }
 
+export function buildChatStopConditions() {
+  return [
+    stepCountIs(500),
+    hasToolCall(getChatStopToolNames().swapAgentToolName),
+    hasToolCall(getChatStopToolNames().swapToDefaultAgentToolName),
+  ];
+}
+
+export function getChatStopToolNames() {
+  return {
+    swapAgentToolName: archestraMcpBranding.getToolName("swap_agent"),
+    swapToDefaultAgentToolName: archestraMcpBranding.getToolName(
+      "swap_to_default_agent",
+    ),
+  };
+}
+
 /**
  * Builds the prompt for title generation based on extracted messages.
  */
@@ -1330,7 +1627,7 @@ async function persistNewMessages(
     const existingCount = existingMessages.length;
 
     // Use input messages to find new messages
-    const uiMessages = messages as UiMessage[];
+    const uiMessages = messages as ChatMessage[];
     const newMessages = uiMessages.slice(existingCount);
 
     if (newMessages.length === 0) {
@@ -1347,13 +1644,13 @@ async function persistNewMessages(
       return 0;
     }
 
-    let messagesToStore = messagesToSave as UiMessage[];
+    let messagesToStore: ChatMessage[];
 
     // Strip base64 images and large browser tool results before storing
     if (context === "onFinish") {
       // Log size reduction only for onFinish (where we have complete messages)
       const beforeSize = estimateMessagesSize(messagesToSave);
-      messagesToStore = stripImagesFromMessages(messagesToSave);
+      messagesToStore = normalizeChatMessages(messagesToSave);
       const afterSize = estimateMessagesSize(messagesToStore);
 
       logger.info(
@@ -1369,7 +1666,7 @@ async function persistNewMessages(
       );
     } else {
       // For onError, just strip without detailed logging
-      messagesToStore = stripImagesFromMessages(messagesToStore);
+      messagesToStore = normalizeChatMessages(messagesToSave);
     }
 
     // Append only new messages with timestamps

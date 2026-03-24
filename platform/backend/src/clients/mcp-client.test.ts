@@ -62,7 +62,7 @@ const {
   mockGetOrLoadDeployment: vi.fn(),
 }));
 
-vi.mock("@/mcp-server-runtime", () => ({
+vi.mock("@/k8s/mcp-server-runtime", () => ({
   McpServerRuntimeManager: {
     usesStreamableHttp: mockUsesStreamableHttp,
     getHttpEndpointUrl: mockGetHttpEndpointUrl,
@@ -152,350 +152,6 @@ describe("McpClient", () => {
         id: "call_123",
         isError: true,
         error: expect.stringContaining("Tool not found"),
-      });
-    });
-
-    describe("Response Modifier Templates", () => {
-      test("applies simple text template to tool response", async () => {
-        // Create MCP tool with response modifier template
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__test_tool",
-          description: "Test MCP tool",
-          parameters: {},
-          catalogId,
-        });
-
-        // Assign tool to agent with response modifier
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate:
-            'Modified: {{{lookup (lookup response 0) "text"}}}',
-        });
-
-        // Mock the MCP client response with realistic GitHub issues data
-        mockCallTool.mockResolvedValueOnce({
-          content: [
-            {
-              type: "text",
-              text: '{"issues":[{"id":3550499726,"number":816,"state":"OPEN","title":"Add authentication for MCP gateways"}]}',
-            },
-          ],
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__test_tool",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        expect(result).toEqual({
-          id: "call_1",
-          content: [
-            {
-              type: "text",
-              text: 'Modified: {"issues":[{"id":3550499726,"number":816,"state":"OPEN","title":"Add authentication for MCP gateways"}]}',
-            },
-          ],
-          isError: false,
-          name: "github-mcp-server__test_tool",
-        });
-      });
-
-      test("applies JSON template to tool response", async () => {
-        // Create MCP tool with JSON response modifier template
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__json_tool",
-          description: "Test MCP tool with JSON",
-          parameters: {},
-          catalogId,
-        });
-
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate:
-            '{{#with (lookup response 0)}}{"formatted": true, "data": "{{{this.text}}}"}{{/with}}',
-        });
-
-        mockCallTool.mockResolvedValueOnce({
-          content: [{ type: "text", text: "test data" }],
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__json_tool",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        expect(result).toEqual({
-          id: "call_1",
-          content: { formatted: true, data: "test data" },
-          isError: false,
-          name: "github-mcp-server__json_tool",
-        });
-      });
-
-      test("transforms GitHub issues to id:title mapping using json helper", async () => {
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__github_issues",
-          description: "GitHub issues tool",
-          parameters: {},
-          catalogId,
-        });
-
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate: `{{#with (lookup response 0)}}{{#with (json this.text)}}
-  {
-  {{#each this.issues}}
-    "{{this.id}}": "{{{escapeJson this.title}}}"{{#unless @last}},{{/unless}}
-  {{/each}}
-}
-{{/with}}{{/with}}`,
-        });
-
-        // Realistic GitHub MCP response with stringified JSON
-        mockCallTool.mockResolvedValueOnce({
-          content: [
-            {
-              type: "text",
-              text: '{"issues":[{"id":3550499726,"number":816,"state":"OPEN","title":"Add authentication for MCP gateways"},{"id":3550391199,"number":815,"state":"OPEN","title":"ERROR: role \\"postgres\\" already exists"}]}',
-            },
-          ],
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__github_issues",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        expect(result).toEqual({
-          id: "call_1",
-          content: {
-            "3550499726": "Add authentication for MCP gateways",
-            "3550391199": 'ERROR: role "postgres" already exists',
-          },
-          isError: false,
-          name: "github-mcp-server__github_issues",
-        });
-      });
-
-      test("uses {{response}} to access full response content", async () => {
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__content_tool",
-          description: "Test tool accessing full content",
-          parameters: {},
-          catalogId,
-        });
-
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate: "{{{json response}}}",
-        });
-
-        mockCallTool.mockResolvedValueOnce({
-          content: [
-            { type: "text", text: "Line 1" },
-            { type: "text", text: "Line 2" },
-          ],
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__content_tool",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        expect(result?.content).toEqual([
-          { type: "text", text: "Line 1" },
-          { type: "text", text: "Line 2" },
-        ]);
-      });
-
-      test("falls back to original content when template fails", async () => {
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__bad_template",
-          description: "Test tool with bad template",
-          parameters: {},
-          catalogId,
-        });
-
-        // Invalid Handlebars template
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate: "{{#invalid",
-        });
-
-        const originalContent = [{ type: "text", text: "Original" }];
-        mockCallTool.mockResolvedValueOnce({
-          content: originalContent,
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__bad_template",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        // Should fall back to original content when template fails
-
-        expect(result).toEqual({
-          id: "call_1",
-          content: originalContent,
-          isError: false,
-          name: "github-mcp-server__bad_template",
-        });
-      });
-
-      test("handles non-text content gracefully", async () => {
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__image_tool",
-          description: "Test tool with image content",
-          parameters: {},
-          catalogId,
-        });
-
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate:
-            'Type: {{lookup (lookup response 0) "type"}}',
-        });
-
-        // Response with image instead of text
-        mockCallTool.mockResolvedValueOnce({
-          content: [{ type: "image", data: "base64data" }],
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__image_tool",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        expect(result?.content).toEqual([
-          { type: "text", text: "Type: image" },
-        ]);
-      });
-
-      test("executes tool without template when none is set", async () => {
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__no_template",
-          description: "Test tool without template",
-          parameters: {},
-          catalogId,
-        });
-
-        // Assign tool without response modifier template
-        await AgentToolModel.create(agentId, tool.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate: null,
-        });
-
-        const originalContent = [{ type: "text", text: "Unmodified" }];
-        mockCallTool.mockResolvedValueOnce({
-          content: originalContent,
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "github-mcp-server__no_template",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        expect(result).toEqual({
-          id: "call_1",
-          content: originalContent,
-          isError: false,
-          name: "github-mcp-server__no_template",
-        });
-      });
-
-      test("applies different templates to different tools", async () => {
-        // Create two tools with different templates
-        const tool1 = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__tool1",
-          description: "First tool",
-          parameters: {},
-          catalogId,
-        });
-
-        const tool2 = await ToolModel.createToolIfNotExists({
-          name: "github-mcp-server__tool2",
-          description: "Second tool",
-          parameters: {},
-          catalogId,
-        });
-
-        await AgentToolModel.create(agentId, tool1.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate:
-            'Template 1: {{lookup (lookup response 0) "text"}}',
-        });
-
-        await AgentToolModel.create(agentId, tool2.id, {
-          credentialSourceMcpServerId: mcpServerId,
-          responseModifierTemplate:
-            'Template 2: {{lookup (lookup response 0) "text"}}',
-        });
-
-        mockCallTool
-          .mockResolvedValueOnce({
-            content: [{ type: "text", text: "Response 1" }],
-            isError: false,
-          })
-          .mockResolvedValueOnce({
-            content: [{ type: "text", text: "Response 2" }],
-            isError: false,
-          });
-
-        const toolCall1 = {
-          id: "call_1",
-          name: "github-mcp-server__tool1",
-          arguments: {},
-        };
-
-        const toolCall2 = {
-          id: "call_2",
-          name: "github-mcp-server__tool2",
-          arguments: {},
-        };
-
-        const result1 = await mcpClient.executeToolCall(toolCall1, agentId);
-        const result2 = await mcpClient.executeToolCall(toolCall2, agentId);
-
-        expect(result1).toEqual({
-          id: "call_1",
-          content: [{ type: "text", text: "Template 1: Response 1" }],
-          isError: false,
-          name: "github-mcp-server__tool1",
-        });
-        expect(result2).toEqual({
-          id: "call_2",
-          content: [{ type: "text", text: "Template 2: Response 2" }],
-          isError: false,
-          name: "github-mcp-server__tool2",
-        });
       });
     });
 
@@ -763,49 +419,6 @@ describe("McpClient", () => {
           isError: true,
           error: expect.stringContaining("No HTTP endpoint URL found"),
           name: "local-streamable-http-server__test_tool",
-        });
-      });
-
-      test("applies response modifier template with streamable-http", async () => {
-        // Create tool with response modifier template
-        const tool = await ToolModel.createToolIfNotExists({
-          name: "local-streamable-http-server__formatted_tool",
-          description: "Tool with template",
-          parameters: {},
-          catalogId: localCatalogId,
-        });
-
-        await AgentToolModel.create(agentId, tool.id, {
-          executionSourceMcpServerId: localMcpServerId,
-          responseModifierTemplate:
-            'Result: {{{lookup (lookup response 0) "text"}}}',
-        });
-
-        // Mock runtime manager responses
-        mockUsesStreamableHttp.mockResolvedValue(true);
-        mockGetHttpEndpointUrl.mockReturnValue("http://localhost:30123/mcp");
-
-        // Mock tool call response
-        mockCallTool.mockResolvedValue({
-          content: [{ type: "text", text: "Original content" }],
-          isError: false,
-        });
-
-        const toolCall = {
-          id: "call_1",
-          name: "local-streamable-http-server__formatted_tool",
-          arguments: {},
-        };
-
-        const result = await mcpClient.executeToolCall(toolCall, agentId);
-
-        // Verify template was applied
-
-        expect(result).toEqual({
-          id: "call_1",
-          content: [{ type: "text", text: "Result: Original content" }],
-          isError: false,
-          name: "local-streamable-http-server__formatted_tool",
         });
       });
 
@@ -2132,6 +1745,121 @@ describe("McpClient", () => {
           name: "search_issues",
           arguments: {},
         });
+      });
+    });
+
+    describe("Tool name suffix fallback", () => {
+      test("resolves unprefixed tool name by suffix when no exact match", async () => {
+        // Create a tool with the full prefixed name
+        const tool = await ToolModel.createToolIfNotExists({
+          name: "github-mcp-server__refresh-stats",
+          description: "Refresh stats",
+          parameters: {},
+          catalogId,
+          mcpServerId,
+        });
+
+        await AgentToolModel.create(agentId, tool.id, {
+          credentialSourceMcpServerId: mcpServerId,
+        });
+
+        mockCallTool.mockResolvedValueOnce({
+          content: [{ type: "text", text: "refreshed" }],
+          isError: false,
+        });
+
+        // Call with unprefixed name (no "__") — triggers suffix fallback
+        const toolCall = {
+          id: "call_suffix_1",
+          name: "refresh-stats",
+          arguments: {},
+        };
+
+        const result = await mcpClient.executeToolCall(toolCall, agentId);
+
+        expect(result.isError).toBe(false);
+        // The tool name should be rewritten to the full prefixed name
+        expect(result.name).toBe("github-mcp-server__refresh-stats");
+      });
+
+      test("does not use suffix fallback when name contains separator", async () => {
+        // Tool call with "__" in the name should NOT trigger suffix fallback
+        const toolCall = {
+          id: "call_suffix_2",
+          name: "wrong-server__nonexistent-tool",
+          arguments: {},
+        };
+
+        const result = await mcpClient.executeToolCall(toolCall, agentId);
+
+        expect(result.isError).toBe(true);
+        expect(result.error).toContain("Tool not found");
+      });
+    });
+
+    describe("_meta and structuredContent passthrough", () => {
+      test("passes _meta from callTool result into CommonToolResult", async () => {
+        const tool = await ToolModel.createToolIfNotExists({
+          name: "github-mcp-server__meta_tool",
+          description: "Tool with meta",
+          parameters: {},
+          catalogId,
+          mcpServerId,
+        });
+
+        await AgentToolModel.create(agentId, tool.id, {
+          credentialSourceMcpServerId: mcpServerId,
+        });
+
+        const toolMeta = { ui: { resourceUri: "mcp://widget/stats" } };
+        mockCallTool.mockResolvedValueOnce({
+          content: [{ type: "text", text: "result" }],
+          isError: false,
+          _meta: toolMeta,
+        });
+
+        const toolCall = {
+          id: "call_meta_1",
+          name: "github-mcp-server__meta_tool",
+          arguments: {},
+        };
+
+        const result = await mcpClient.executeToolCall(toolCall, agentId);
+
+        expect(result.isError).toBe(false);
+        expect(result._meta).toEqual(toolMeta);
+      });
+
+      test("passes structuredContent from callTool result into CommonToolResult", async () => {
+        const tool = await ToolModel.createToolIfNotExists({
+          name: "github-mcp-server__structured_tool",
+          description: "Tool with structured content",
+          parameters: {},
+          catalogId,
+          mcpServerId,
+        });
+
+        await AgentToolModel.create(agentId, tool.id, {
+          credentialSourceMcpServerId: mcpServerId,
+        });
+
+        const structured = { dashboard: { widgets: ["chart", "table"] } };
+        mockCallTool.mockResolvedValueOnce({
+          content: [{ type: "text", text: "ok" }],
+          isError: false,
+          structuredContent: structured,
+        });
+
+        const toolCall = {
+          id: "call_structured_1",
+          name: "github-mcp-server__structured_tool",
+          arguments: {},
+        };
+
+        const result = await mcpClient.executeToolCall(toolCall, agentId);
+
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toEqual(structured);
       });
     });
   });

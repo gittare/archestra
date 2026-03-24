@@ -105,6 +105,29 @@ export const getWebSocketUrl = (): string => {
 };
 
 /**
+ * Get the MCP sandbox proxy base URL.
+ * The sandbox server runs on the same host as the backend but on a different port
+ * for iframe origin isolation.
+ *
+ * Uses NEXT_PUBLIC_ARCHESTRA_MCP_SANDBOX_PORT (build-time env var) because the
+ * sandbox URL is infrastructure config required before /api/config loads — same
+ * category as NEXT_PUBLIC_ARCHESTRA_INTERNAL_API_BASE_URL. Changing the port in
+ * Docker/Helm deployments requires a frontend container rebuild.
+ */
+export const getMcpSandboxBaseUrl = (): string => {
+  try {
+    const backendUrl = new URL(getBackendBaseUrl());
+    const sandboxPort = env("NEXT_PUBLIC_ARCHESTRA_MCP_SANDBOX_PORT") || "3002";
+    backendUrl.port = sandboxPort;
+    backendUrl.pathname = "";
+    return backendUrl.origin;
+  } catch {
+    // Invalid backend URL — fall back to default sandbox origin
+    return "http://localhost:3002";
+  }
+};
+
+/**
  * Configuration object for the frontend application.
  * Use process.env.NEXT_PUBLIC_xxxx to access build-time variables in build-time,
  * and env('NEXT_PUBLIC_xxxx') to access the runtime variables in runtime.
@@ -186,7 +209,8 @@ export default {
     },
     get fullWhiteLabeling() {
       return (
-        env("NEXT_PUBLIC_ARCHESTRA_ENTERPRISE_FULL_WHITE_LABELING") === "true"
+        env("NEXT_PUBLIC_ARCHESTRA_ENTERPRISE_LICENSE_FULL_WHITE_LABELING") ===
+        "true"
       );
     },
   },

@@ -6,6 +6,7 @@ import {
   DEFAULT_ADMIN_EMAIL_ENV_VAR_NAME,
   DEFAULT_ADMIN_PASSWORD,
   DEFAULT_ADMIN_PASSWORD_ENV_VAR_NAME,
+  DEFAULT_APP_NAME,
   DEFAULT_VAULT_TOKEN,
   type SupportedProvider,
   SupportedProviders,
@@ -16,11 +17,9 @@ import {
   type EmailProviderType,
   EmailProviderTypeSchema,
 } from "@/types/email-provider-type";
-import {
-  type KnowledgeGraphProviderType,
-  KnowledgeGraphProviderTypeSchema,
-} from "@/types/knowledge-graph";
 import packageJson from "../../package.json";
+
+type ProcessType = "web" | "worker" | "all";
 
 /**
  * Load .env from platform root
@@ -34,6 +33,8 @@ const sentryDsn = process.env.ARCHESTRA_SENTRY_BACKEND_DSN || "";
 const environment = process.env.NODE_ENV?.toLowerCase() ?? "";
 const isProduction = ["production", "prod"].includes(environment);
 const isDevelopment = !isProduction;
+
+const appVersion = process.env.ARCHESTRA_VERSION || packageJson.version;
 
 const frontendBaseUrl =
   process.env.ARCHESTRA_FRONTEND_URL?.trim() || "http://localhost:3000";
@@ -239,18 +240,6 @@ const parseIncomingEmailProvider = (): EmailProviderType | undefined => {
 };
 
 /**
- * Parse knowledge graph provider from environment variable
- */
-const parseKnowledgeGraphProvider = ():
-  | KnowledgeGraphProviderType
-  | undefined => {
-  const provider =
-    process.env.ARCHESTRA_KNOWLEDGE_GRAPH_PROVIDER?.toLowerCase();
-  const result = KnowledgeGraphProviderTypeSchema.safeParse(provider);
-  return result.success ? result.data : undefined;
-};
-
-/**
  * Parse body limit from environment variable.
  * Supports numeric bytes (e.g., "52428800") or human-readable format (e.g., "50MB", "100KB").
  */
@@ -450,13 +439,40 @@ export const parseSampleRate = (
   return parsed;
 };
 
+/**
+ * Parse ARCHESTRA_TRUST_PROXY into the value Fastify's trustProxy option accepts.
+ *
+ * Fastify supports:
+ *   - true  – trust all proxies
+ *   - false – trust no proxies (default)
+ *   - a comma-separated string of IPs/CIDRs – trust specific proxies
+ *
+ * This maps the env var as follows:
+ *   undefined / ""  → false
+ *   "true"          → true
+ *   "false"         → false
+ *   anything else   → trimmed string passed directly to Fastify (IP/CIDR list)
+ */
+export const parseTrustProxy = (
+  envValue: string | undefined,
+): boolean | string => {
+  const trimmed = envValue?.trim();
+  if (!trimmed || trimmed === "false") return false;
+  if (trimmed === "true") return true;
+  return trimmed
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(",");
+};
+
 const config = {
   frontendBaseUrl,
   api: {
     host: isDevelopment ? "127.0.0.1" : "0.0.0.0",
     port: getPortFromUrl(),
-    name: "Archestra",
-    version: process.env.ARCHESTRA_VERSION || packageJson.version,
+    name: DEFAULT_APP_NAME,
+    version: appVersion,
     corsOrigins: getCorsOrigins(),
     apiKeyAuthorizationHeaderName: "Authorization",
     /**
@@ -469,6 +485,7 @@ const config = {
       process.env.ARCHESTRA_API_BODY_LIMIT,
       DEFAULT_BODY_LIMIT,
     ),
+    trustProxy: parseTrustProxy(process.env.ARCHESTRA_TRUST_PROXY),
   },
   websocket: {
     path: "/ws",
@@ -502,13 +519,6 @@ const config = {
       },
     },
   },
-  knowledgeGraph: {
-    provider: parseKnowledgeGraphProvider(),
-    lightrag: {
-      apiUrl: process.env.ARCHESTRA_KNOWLEDGE_GRAPH_LIGHTRAG_API_URL || "",
-      apiKey: process.env.ARCHESTRA_KNOWLEDGE_GRAPH_LIGHTRAG_API_KEY,
-    },
-  },
   auth: {
     secret: process.env.ARCHESTRA_AUTH_SECRET,
     trustedOrigins: getTrustedOrigins(),
@@ -538,7 +548,7 @@ const config = {
         process.env.ARCHESTRA_OPENROUTER_REFERER ||
         process.env.ARCHESTRA_FRONTEND_URL?.trim() ||
         frontendBaseUrl,
-      title: process.env.ARCHESTRA_OPENROUTER_TITLE || "Archestra",
+      title: process.env.ARCHESTRA_OPENROUTER_TITLE || DEFAULT_APP_NAME,
     },
     anthropic: {
       baseUrl:
@@ -606,9 +616,18 @@ const config = {
     bedrock: {
       enabled: Boolean(process.env.ARCHESTRA_BEDROCK_BASE_URL),
       baseUrl: process.env.ARCHESTRA_BEDROCK_BASE_URL || "",
-      /** Prefix for cross-region inference profile models (e.g., "us." or "eu.") */
-      inferenceProfilePrefix:
-        process.env.ARCHESTRA_BEDROCK_INFERENCE_PROFILE_PREFIX || "",
+      /** Enable AWS IAM authentication (IRSA, env vars, instance profile) instead of API key */
+      iamAuthEnabled: process.env.ARCHESTRA_BEDROCK_IAM_AUTH_ENABLED === "true",
+      /** Explicit AWS region override; falls back to extracting from base URL */
+      region: process.env.ARCHESTRA_BEDROCK_REGION || "",
+      /** Comma-separated list of provider prefixes to include (e.g., "anthropic,amazon"). Empty = allow all. */
+      allowedProviders: parseCommaSeparatedList(
+        process.env.ARCHESTRA_BEDROCK_ALLOWED_PROVIDERS || "",
+      ),
+      /** Comma-separated list of inference region prefixes to include (e.g., "us,global"). Empty = allow all. */
+      allowedInferenceRegions: parseCommaSeparatedList(
+        process.env.ARCHESTRA_BEDROCK_ALLOWED_INFERENCE_REGIONS || "",
+      ),
     },
     minimax: {
       baseUrl:
@@ -679,8 +698,11 @@ const config = {
   },
   enterpriseFeatures: {
     core: process.env.ARCHESTRA_ENTERPRISE_LICENSE_ACTIVATED === "true",
+    knowledgeBase:
+      process.env.ARCHESTRA_ENTERPRISE_LICENSE_KNOWLEDGE_BASE_ACTIVATED ===
+      "true",
     fullWhiteLabeling:
-      process.env.ARCHESTRA_ENTERPRISE_FULL_WHITE_LABELING === "true",
+      process.env.ARCHESTRA_ENTERPRISE_LICENSE_FULL_WHITE_LABELING === "true",
   },
   /**
    * Codegen mode is set when running `pnpm codegen` via turbo.
@@ -689,11 +711,9 @@ const config = {
    */
   codegenMode: process.env.CODEGEN === "true",
   orchestrator: {
-    // The MCP server base image version is automatically updated by release-please during releases.
-    // See: https://github.com/googleapis/release-please/blob/main/docs/customizing.md#updating-arbitrary-files
     mcpServerBaseImage:
       process.env.ARCHESTRA_ORCHESTRATOR_MCP_SERVER_BASE_IMAGE ||
-      "europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-base:1.0.60", // x-release-please-version
+      `europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/mcp-server-base:${appVersion}`,
     kubernetes: {
       namespace: process.env.ARCHESTRA_ORCHESTRATOR_K8S_NAMESPACE || "default",
       kubeconfig: process.env.ARCHESTRA_ORCHESTRATOR_KUBECONFIG,
@@ -703,10 +723,24 @@ const config = {
         "true",
       k8sNodeHost:
         process.env.ARCHESTRA_ORCHESTRATOR_K8S_NODE_HOST || undefined,
+      clusterDomain:
+        process.env.ARCHESTRA_ORCHESTRATOR_K8S_CLUSTER_DOMAIN ||
+        "cluster.local",
     },
   },
   vault: {
     token: process.env.ARCHESTRA_HASHICORP_VAULT_TOKEN || DEFAULT_VAULT_TOKEN,
+  },
+  mcpSandbox: {
+    port: Number(process.env.ARCHESTRA_MCP_SANDBOX_PORT) || 3002,
+    /** Path to the sandbox proxy HTML file (co-located in backend static dir). */
+    filePath: path.resolve(__dirname, "static/mcp-sandbox-proxy.html"),
+    /**
+     * Explicitly configured origins that are allowed to embed the sandbox iframe.
+     * Empty array means no restriction (open / dev deployment).
+     * Mirrors the CORS/trusted-origin configuration so all three stay in sync.
+     */
+    allowedOrigins: addLoopbackEquivalents(getConfiguredOrigins()),
   },
   observability: {
     otel: {
@@ -760,16 +794,58 @@ const config = {
       process.env.ARCHESTRA_LLM_PROXY_VIRTUAL_KEYS_DEFAULT_EXPIRATION_SECONDS,
     ),
   },
-  benchmark: {
-    mockMode: process.env.BENCHMARK_MOCK_MODE === "true",
+  kb: {
+    hybridSearchEnabled:
+      process.env.ARCHESTRA_KNOWLEDGE_BASE_HYBRID_SEARCH_ENABLED !== "false",
+    connectorSyncMaxDurationSeconds: parseConnectorSyncMaxDuration(
+      process.env.ARCHESTRA_KNOWLEDGE_BASE_CONNECTOR_SYNC_MAX_DURATION_SECONDS,
+    ),
+    taskWorkerPollIntervalSeconds: Number.parseInt(
+      process.env.ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_POLL_INTERVAL_SECONDS ||
+        "5",
+      10,
+    ),
+    taskWorkerMaxConcurrent: Number.parseInt(
+      process.env.ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_MAX_CONCURRENT || "2",
+      10,
+    ),
+    taskWorkerShutdownTimeoutSeconds: Number.parseInt(
+      process.env
+        .ARCHESTRA_KNOWLEDGE_BASE_TASK_WORKER_SHUTDOWN_TIMEOUT_SECONDS || "30",
+      10,
+    ),
+  },
+  secretsManager: {
+    type: process.env.ARCHESTRA_SECRETS_MANAGER?.toUpperCase() || "DB",
+    vaultKvVersion: process.env.ARCHESTRA_HASHICORP_VAULT_KV_VERSION || "2",
+  },
+  test: {
+    enableE2eTestEndpoints: process.env.ENABLE_E2E_TEST_ENDPOINTS === "true",
+    enableTestMcpServer: process.env.ENABLE_TEST_MCP_SERVER === "true",
+    testValue: process.env.TEST_VALUE ?? null,
   },
   authRateLimitDisabled:
     process.env.ARCHESTRA_AUTH_RATE_LIMIT_DISABLED === "true",
   isQuickstart: process.env.ARCHESTRA_QUICKSTART === "true",
   ngrokDomain: process.env.ARCHESTRA_NGROK_DOMAIN || "",
+  processType: parseProcessType(process.env.ARCHESTRA_PROCESS_TYPE),
 };
 
+export const shouldRunWebServer = config.processType !== "worker";
+export const shouldRunWorker = config.processType !== "web";
+
 export default config;
+
+// ===== Internal helpers =====
+
+export function parseConnectorSyncMaxDuration(
+  value: string | undefined,
+): number | undefined {
+  const DEFAULT = 3300; // 55 minutes
+  const seconds = Number.parseInt(value || String(DEFAULT), 10);
+  if (Number.isNaN(seconds) || seconds <= 0) return undefined;
+  return seconds;
+}
 
 /**
  * Get the environment variable API key for a provider.
@@ -783,4 +859,17 @@ export function getProviderEnvApiKey(
     return entry.apiKey || undefined;
   }
   return undefined;
+}
+
+export function parseProcessType(value: string | undefined): ProcessType {
+  const normalized = value?.toLowerCase();
+  if (normalized === "web" || normalized === "worker") return normalized;
+  return "all";
+}
+
+export function parseCommaSeparatedList(value: string): string[] {
+  return value
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }

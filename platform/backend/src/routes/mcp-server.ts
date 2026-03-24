@@ -3,8 +3,8 @@ import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { z } from "zod";
 import { hasPermission } from "@/auth";
 import mcpClient from "@/clients/mcp-client";
+import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
 import logger from "@/logging";
-import { McpServerRuntimeManager } from "@/mcp-server-runtime";
 import {
   AgentToolModel,
   InternalMcpCatalogModel,
@@ -571,6 +571,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
                   name: ToolModel.slugifyName(toolNamePrefix, tool.name),
                   description: tool.description,
                   parameters: tool.inputSchema,
+                  meta: { _meta: tool._meta, annotations: tool.annotations },
                   catalogId: capturedCatalogId,
                 }));
 
@@ -658,6 +659,7 @@ const mcpServerRoutes: FastifyPluginAsyncZod = async (fastify) => {
           name: ToolModel.slugifyName(mcpServer.name, tool.name),
           description: tool.description,
           parameters: tool.inputSchema,
+          meta: { _meta: tool._meta, annotations: tool.annotations },
           catalogId: catalogItem.id,
         }));
 
